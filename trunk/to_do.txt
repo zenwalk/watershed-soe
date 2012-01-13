@@ -1,0 +1,11 @@
+Return geometry - optional
+Hydroshed id - include in result DONE
+Search coords - include in result DONE
+Median - remove DONE
+Attribs - separate json objects optional
+Extent - try to set automatically if not provided DONE
+
+Export - save all watersheds to a single in-memory workspace
+Export - Create second REST operation to export watersheds
+ as features from in-memory workspace based on hydroshed id
+
