@@ -46,21 +46,27 @@ namespace WatershedSOE
         private string elevname = "irn_elev";
         private string riversname = "irn_import";
 
-       // private string accum_prefix = "FA_";
-       // private string direction_prefix = "FD_";
         private string accum_name = "fac";
         private string dir_name = "fdr";
-       // private string m_FlowAccLayerName;
-       // private string m_FlowDirLayerName;
-       // private IGeoDataset m_FlowDirDataset;
-       // private IGeoDataset m_FlowAccDataset;
+        
+        // variables to do with configuring the data sources automatically
+        private string m_FlowAccLayerName;
+        private string m_FlowDirLayerName;
+        private string m_ExtentFeatureLayerName;
+        // variables to hold list of layer ids for each extraction type
+        private List<ExtractionLayerConfig> m_ExtractableParams = new List<ExtractionLayerConfig>();
+        private IGeoDataset m_FlowDirDataset;
+        private IGeoDataset m_FlowAccDataset;
+        private IGeoDataset m_ExtentFeatureDataset;
+        // true if both flow acc and flow dir layers are found
+        // otherwise can only extract by input polygon (watershed operation not added to REST schema)
+        private bool m_CanDoWatershed;
 
         public WatershedSOE()
         {
             soe_name = "WatershedSOE";
             logger = new ServerLogger();
             logger.LogMessage(ServerLogger.msgType.infoStandard,"startup",8000,"soe_name is "+soe_name);
-            reqHandler = new SoeRestImpl(soe_name, CreateRestSchema()) as IRESTRequestHandler;
         }
 
         #region IServerObjectExtension Members
@@ -84,35 +90,13 @@ namespace WatershedSOE
 
         public void Construct(IPropertySet props)
         {
-            /*
             try
             {
-                logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "watershed SOE constructor");
-                if (props != null)
+                logger.LogMessage(ServerLogger.msgType.infoDetailed, "Construct", 8000, "Watershed SOE constructor running");
+                if (props.GetProperty("FlowAccLayer") != null)
                 {
-                    logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "watershed SOE props present");
-                    configProps = props;
-                    string propstring = props.ToString();
-                    System.Object tnames;
-                    System.Object tvalues;
-                    props.GetAllProperties(out tnames, out tvalues);
-                    
-                    foreach (string i in (String[])tnames)
-                    {
-                        logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "prop name is "+i);
-                        logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "prop values are "+tvalues.ToString());
-                    
-                    }
-                    
-                }
-                else
-                {
-                    logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "watershed SOE props null");
-                }
-                if (props.GetProperty("FlowAccum") != null)
-                {
-                    m_FlowAccLayerName = props.GetProperty("FlowAccum") as string;
-                    logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "WSH: got FlowAccum");
+                    m_FlowAccLayerName = props.GetProperty("FlowAccLayer") as string;
+                    logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "WSH: found definition for Flow Accumulation layer: "+m_FlowAccLayerName);
 
                 }
                 else
@@ -120,16 +104,27 @@ namespace WatershedSOE
                     logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "WSH: FlowAccum property missing");
                     throw new ArgumentNullException();
                 }
-                if (props.GetProperty("FlowDir") != null)
+                if (props.GetProperty("FlowDirLayer") != null)
                 {
-                    m_FlowDirLayerName = props.GetProperty("FlowDir") as string;
-                    logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "WSH: got FlowDir");
+                    m_FlowDirLayerName = props.GetProperty("FlowDirLayer") as string;
+                    logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "WSH: found definition for Flow Direction layer: "+m_FlowDirLayerName);
                 }
                 else
                 {
                     logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "WSH: Flowdir property missing");
                     throw new ArgumentNullException();
                 }
+                if (props.GetProperty("ExtentFeatureLayer") != null)
+                {
+                    m_ExtentFeatureLayerName = props.GetProperty("ExtentFeatureLayer") as string;
+                    logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "WSH: found definition for Extent Feature layer: " + m_ExtentFeatureLayerName);
+                }
+                else
+                {
+                    logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, "WSH: no definition for extent feature layers found. Extent may still be passed as input");
+                    // no exception, as this isn't a required layer
+                }
+
             }
             catch (Exception e)
             {
@@ -138,21 +133,26 @@ namespace WatershedSOE
                 logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, e.ToString());
                 logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, e.TargetSite.Name);
                 logger.LogMessage(ServerLogger.msgType.infoStandard, "Construct", 8000, e.StackTrace);
-
-
-
-               
             }
+            
             try
             {
-                // get the flow accum and direction datasets: we only need to do this at startup not each time
+                // get the datasets associated with the configured inputs to watershed delineation. 
+                // Also note the other layers: we will make all others available for extraction
+                // but need to note the data type and how the layer name should translate into a REST operation
+                // parameter
+                // We only need to do this at startup not each time
                 IMapServer3 mapServer = (IMapServer3)serverObjectHelper.ServerObject;
                 string mapName = mapServer.DefaultMapName;
                 IMapLayerInfo layerInfo;
                 IMapLayerInfos layerInfos = mapServer.GetServerInfo(mapName).MapLayerInfos;
+                IMapServerDataAccess dataAccess = (IMapServerDataAccess)mapServer;
+                
                 int c = layerInfos.Count;
                 int acc_layerIndex=0;
                 int dir_layerIndex=0;
+                int ext_layerIndex=0;
+                //Dictionary<int,string> other_layerIndices = new Dictionary<int,string>();
                 for (int i=0;i<c;i++)
                 {
                     layerInfo = layerInfos.get_Element(i);
@@ -164,12 +164,82 @@ namespace WatershedSOE
                     {
                         dir_layerIndex = i;
                     }
-                    if(acc_layerIndex != 0 && dir_layerIndex != 0)
+                    else if (m_ExtentFeatureLayerName != null && layerInfo.Name == m_ExtentFeatureLayerName)
                     {
-                        break;
+                        ext_layerIndex = i;
+                    }
+                    else
+                    {
+                        // Types appear to be "Raster Layer", "Feature Layer", and "Group Layer"
+                        logger.LogMessage(ServerLogger.msgType.infoStandard, 
+                            "Construct", 8000, 
+                            "WSH: found additional map layer "+layerInfo.Name+" at ID "+
+                            layerInfo.ID+" of type "+layerInfo.Type+" with display field "+layerInfo.DisplayField);
+                        if (layerInfo.Type == "Raster Layer" || layerInfo.Type == "Feature Layer")
+                        {
+                            string tName = layerInfo.Name;
+                            string tParamName = tName.Split(':')[0];
+                            if (tParamName.Length > 6)
+                            {
+                                tParamName = layerInfo.Description.Split(':')[0];
+                            }
+                            if (tParamName.Length > 6)
+                            {
+                                // fail if any of the map layers except the ones used for the catchment definition
+                                // don't have a name or description starting with 6 or less characters followed by :
+                                logger.LogMessage(ServerLogger.msgType.error, "Construct", 8000,
+                                     " Watershed SOE warning: could determine output parameter string for layer " + tName +
+                                     " and it will not be available for extraction. "+
+                                     " Ensure that either the layer name or description starts with an ID for the " +
+                                     " service parameter name to be exposed, max 6 characters and separated by ':'" +
+                                     " e.g. 'LCM2K:Land Cover Map 2000'");
+                                continue;
+                                //throw new ArgumentException();
+                            }
+                            ExtractionTypes tExtractionType = ExtractionTypes.Ignore;
+                            if (layerInfo.Type == "Raster Layer")
+                            {
+                                IRaster tRaster = dataAccess.GetDataSource(mapName, i) as IRaster;
+                                IRasterProps tRasterProps = tRaster as IRasterProps;
+                                if (tRasterProps.IsInteger)
+                                {
+                                    tExtractionType = ExtractionTypes.CategoricalRaster;
+                                }
+                                else
+                                {
+                                    tExtractionType = ExtractionTypes.ContinuousRaster;
+                                }
+                                ExtractionLayerConfig tLayerInfo = new ExtractionLayerConfig
+                                    (i, tExtractionType, tParamName,-1,-1,-1);
+                                m_ExtractableParams.Add(tLayerInfo);
+                            }
+                            else
+                            {
+                                IFeatureClass tFC = dataAccess.GetDataSource(mapName, i) as IFeatureClass;
+                                esriGeometryType tFCType = tFC.ShapeType;
+                                if (tFCType == esriGeometryType.esriGeometryPoint || tFCType == esriGeometryType.esriGeometryMultipoint)
+                                {
+                                    tExtractionType = ExtractionTypes.PointFeatures;
+                                }
+                                else if (tFCType == esriGeometryType.esriGeometryPolyline || tFCType == esriGeometryType.esriGeometryLine)
+                                {
+                                    tExtractionType = ExtractionTypes.LineFeatures;
+                                }
+                                else if (tFCType == esriGeometryType.esriGeometryPolygon)
+                                {
+                                    tExtractionType = ExtractionTypes.PolygonFeatures;
+                                }
+                                int tCategoryField = layerInfo.Fields.FindFieldByAliasName("CATEGORY");
+                                int tValueField= layerInfo.Fields.FindFieldByAliasName("VALUE");
+                                int tMeasureField = layerInfo.Fields.FindFieldByAliasName("MEASURE");
+                                ExtractionLayerConfig tLayerInfo = new ExtractionLayerConfig
+                                    (i, tExtractionType, tParamName,tCategoryField,tValueField,tMeasureField);
+                                m_ExtractableParams.Add(tLayerInfo);
+                                // layers with any other geometry type will be ignored
+                            }
+                        }
                     }
                 }
-                IMapServerDataAccess dataAccess = (IMapServerDataAccess)mapServer;
                 IRaster tFDR = dataAccess.GetDataSource(mapName,dir_layerIndex) as IRaster;
                 m_FlowDirDataset =  tFDR as IGeoDataset;
                 IRaster tFAR = dataAccess.GetDataSource(mapName,acc_layerIndex) as IRaster;
@@ -177,14 +247,32 @@ namespace WatershedSOE
                 if(m_FlowDirDataset == null || m_FlowAccDataset == null)
                 {
                     logger.LogMessage(ServerLogger.msgType.error,"Construct", 8000,"Watershed SOE Error: layer not found");
-                    return;
+                    m_CanDoWatershed = false;
+                   // return;
+                }
+                else 
+                {
+                    m_CanDoWatershed = true;
+                }
+                if (ext_layerIndex != 0)
+                {
+                    m_ExtentFeatureDataset = dataAccess.GetDataSource(mapName, ext_layerIndex) as IGeoDataset;
                 }
             }
             catch
             {
-                logger.LogMessage(ServerLogger.msgType.error,"Construct",8000,"Watershed SOE error: could not get the flow direction and accumulation datasets");
+                logger.LogMessage(ServerLogger.msgType.error,"Construct",8000,"Watershed SOE error: could not get the datasets associated with configured map layers");
             }
-       */ 
+            try
+            {
+                reqHandler = new SoeRestImpl(soe_name, CreateRestSchema()) as IRESTRequestHandler;
+            }
+            catch (Exception e)
+            {
+                logger.LogMessage(ServerLogger.msgType.error, "Construct", 8000, "WSH: could not create REST schema. Exception: "+e.Message+ " "+e.Source+" "+e.StackTrace+" "+e.TargetSite);
+         
+            }
+        
        }
         
         #endregion
@@ -206,13 +294,43 @@ namespace WatershedSOE
         private RestResource CreateRestSchema()
         {
             RestResource rootRes = new RestResource(soe_name, false, RootResHandler);
-
-            RestOperation watershedOper = new RestOperation("createWatershed",
-                                                      new string[] { "hydroshed_id", "location", "extent", "lcm2k", "elev","totalupstream" },
+            logger.LogMessage(ServerLogger.msgType.infoDetailed, "CreateRestSchema", 8000, 
+                "WSH: attempting to create REST schema");
+         
+            // build the rest schema to reflect the layers available for extraction in this particular service
+            IMapServer3 mapServer = (IMapServer3)serverObjectHelper.ServerObject;
+            string mapName = mapServer.DefaultMapName;
+            IMapLayerInfo layerInfo;
+            IMapLayerInfos layerInfos = mapServer.GetServerInfo(mapName).MapLayerInfos;
+            List<string> tOptionalParams = new List<string>();
+            foreach (ExtractionLayerConfig tExtractableLayer in m_ExtractableParams)
+            {
+                tOptionalParams.Add(tExtractableLayer.ParamName);
+                    logger.LogMessage(ServerLogger.msgType.infoDetailed, "CreateRestSchema", 8000,
+                        "WSH: added parameter "+tExtractableLayer.ParamName);
+            }
+            List<string> tPermanentParams = new List<string>(){"hydroshed_id","location","extent"};
+            List<string> tAllParams = new List<string>();
+            tAllParams.AddRange(tPermanentParams);
+            tAllParams.AddRange(tOptionalParams);
+            // RestOperation constructor takes: name, parameter(s), format(s), handler
+            if (m_CanDoWatershed){
+                RestOperation watershedOper = new RestOperation("createWatershed",
+                                                      //new string[] { "hydroshed_id", "location", "extent", "lcm2k", "elev","totalupstream" },
+                                                      tAllParams.ToArray(),
                                                       new string[] { "json" },
                                                       CreateWatershedHandler);
-
-            rootRes.operations.Add(watershedOper);
+                
+                rootRes.operations.Add(watershedOper);
+                
+            }
+            List<string> tPolygonExtractionParams = new List<string>(){"extraction_id","polygon"};
+            tPolygonExtractionParams.AddRange(tOptionalParams);
+            RestOperation extractByPolygonOper = new RestOperation("extractByPolygon",
+                                                    tPolygonExtractionParams.ToArray(),
+                                                    new string[] { "json" },
+                                                    ExtractByPolygonHandler);
+            rootRes.operations.Add(extractByPolygonOper);
             return rootRes;
         }
 
@@ -271,6 +389,19 @@ namespace WatershedSOE
                 tAnalysisEnvelope = null;
                 logger.LogMessage(ServerLogger.msgType.debug, "process input params", 8000, "No input extent parameter requested ");
             }
+            List<ExtractionLayerConfig> extractionRequests = new List<ExtractionLayerConfig>();
+            foreach (ExtractionLayerConfig tExtLayerInfo in m_ExtractableParams)
+            {
+                string jsonParam = tExtLayerInfo.ParamName;
+                bool? wasRequested;
+                found = operationInput.TryGetAsBoolean(jsonParam, out wasRequested);
+                if (found && wasRequested.HasValue && (bool)wasRequested)
+                {
+                    extractionRequests.Add(tExtLayerInfo);
+                }
+            }
+            #endregion
+
             #region Optional parameters - catchment characteristics to extract
             //LCM2000 (categorical raster)
             bool? nullableBool;
@@ -288,7 +419,6 @@ namespace WatershedSOE
             found = operationInput.TryGetAsBoolean("totalupstream", out nullableBool);
             if ((!nullableBool.HasValue) || (!found)) { doTotalUpstream = false; }
             else { doTotalUpstream = (bool)nullableBool; }
-            #endregion
             #endregion
             #region Do the actual watershed extraction
             // Modified the computeWatershed method to return both the raster and converted polygon versions of the 
@@ -395,9 +525,9 @@ namespace WatershedSOE
                 IPolygon tCatchmentPolygon = (IPolygon)tCatchmentFeature.ShapeCopy;
                 tPolygonIsMultipart = tCatchmentPolygon.ExteriorRingCount > 1;
             }
-            
+            logger.LogMessage(ServerLogger.msgType.debug, "create watershed handler", 99, "created watershed polygon, proceeding with extractions");
             #region Do the catchment characteristic extractions, if any
-            if (doLCM2000)
+            /*if (doLCM2000)
             {
                 logger.LogMessage(ServerLogger.msgType.debug, "create watershed handler", 99, "attempting lcm2k extraction");
                 // Get the polygon - can't use tPolygonAsFC.GetFeature(1), reason as above
@@ -451,8 +581,9 @@ namespace WatershedSOE
                     }
                 }
                 logger.LogMessage(ServerLogger.msgType.debug, "create watershed handler", 99, "Elev extraction ran ok");
-            }
-            if (doTotalUpstream)
+            }*/
+
+            /*if (doTotalUpstream)
             {
                 logger.LogMessage(ServerLogger.msgType.debug, "create watershed handler", 99, "Attempting total upstream summary");
                 string tFieldName = "SUM_UPSTRM";
@@ -477,19 +608,312 @@ namespace WatershedSOE
                 {
                     logger.LogMessage(ServerLogger.msgType.debug, "create watershed handler", 99, "rivers GDS is null...");
                 }
-            }
-
+            }*/
+            // Use the catchment polygon as input into the generic extraction method
+            IGeoDataset tFinalPolygonGDS = ProcessExtractions(tWatershedPolyGDS, tWatershedRasterGDS, extractionRequests);
             #endregion
             // The catchment feature now exists and has all attributes requested. Ready to go.
             // TODO - implement alternative return formats. Either do as follows OR if user chooses not to 
             // return geometry (e.g. for mobile app), build a JSON object manually that has LCM classes etc
             // as nested objects (will make it easier for client to handle LCM, Elevation ,etc, separately)
             IRecordSetInit returnRecSet = new RecordSetClass();
-            returnRecSet.SetSourceTable(tWatershedPolyGDS as ITable, null);
+            //returnRecSet.SetSourceTable(tWatershedPolyGDS as ITable, null);
+            returnRecSet.SetSourceTable(tFinalPolygonGDS as ITable, null);
             IRecordSet recset = returnRecSet as IRecordSet;
             byte[] jsonFeatures = Conversion.ToJson(recset);
             return jsonFeatures;
         }
+        private IGeoDataset ProcessExtractions(IGeoDataset pInputPolygonGDS, IGeoDataset pInputRasterGDS, List<ExtractionLayerConfig> pExtractions)
+        {
+            logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99, "Starting processing: "+pExtractions.Count.ToString()+" extractions");
+            if (pExtractions.Count == 0)
+            {
+                return pInputPolygonGDS;
+            }
+            // stuff required to retrieve data from map layers
+            IMapServer3 mapServer = (IMapServer3)serverObjectHelper.ServerObject;
+            string mapName = mapServer.DefaultMapName;
+            IMapLayerInfo layerInfo;
+            IMapLayerInfos layerInfos = mapServer.GetServerInfo(mapName).MapLayerInfos;
+            IMapServerDataAccess dataAccess = (IMapServerDataAccess)mapServer;
+            // represent the polygon geodataset as an IFeatureClass for adding fields and getting the 
+            // polygon feature to populate info into
+            IFeatureClass tPolygonAsFC = (IFeatureClass)pInputPolygonGDS;
+            IFeatureCursor tFeatureCursor = tPolygonAsFC.Search(null,false);
+            IFeature tExtractionPolygonFeature = tFeatureCursor.NextFeature();
+            IPolygon tExtractionPolygon = tExtractionPolygonFeature.ShapeCopy as IPolygon;
+
+            foreach (ExtractionLayerConfig tThisExtraction in pExtractions)
+            {
+                logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99, 
+                       "Fetching source of layer "+tThisExtraction.ParamName+" in layer id "+tThisExtraction.LayerID.ToString());
+                object tDataObj = dataAccess.GetDataSource(mapName, tThisExtraction.LayerID);
+                switch (tThisExtraction.ExtractionType)
+                {
+                    case ExtractionTypes.CategoricalRaster:
+                        // summarise categorical raster giving a count of pixels of each value
+                        logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99, 
+                            "Layer is a categorical raster");
+                        IGeoDataset tCategoricalRaster = tDataObj as IGeoDataset;
+                        Dictionary<int, double> tCategoricalResults = 
+                            WatershedDetailExtraction.SummariseCategoricalRaster(pInputRasterGDS, tCategoricalRaster);
+                        foreach (int key in tCategoricalResults.Keys)
+                        {
+                            string tFieldName = tThisExtraction.ParamName + "_" + key.ToString();
+                            AddAField(tPolygonAsFC, tFieldName, esriFieldType.esriFieldTypeDouble);
+                        }
+                        // re-retrieve the catchment feature now, ensure the FC has the fields we've just added,
+                        // and store the results into the feature
+                        tFeatureCursor = tPolygonAsFC.Search(null, false);
+                        tExtractionPolygonFeature = tFeatureCursor.NextFeature();
+                        foreach (KeyValuePair<int,double> tClassResult in tCategoricalResults)
+                        {
+                            string tFieldName = tThisExtraction.ParamName+ "_" + tClassResult.Key.ToString();
+                            int tFieldIdx = tExtractionPolygonFeature.Fields.FindField(tFieldName);
+                            if (tFieldIdx != -1)
+                            {
+                                tExtractionPolygonFeature.set_Value(tFieldIdx,tClassResult.Value);
+                                tExtractionPolygonFeature.Store();
+                            }
+                        }
+                        logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99,
+                            "Summary done ok");
+                        break;
+                    case ExtractionTypes.ContinuousRaster:
+                        // summarise continuous raster giving stats of the range of values
+                        logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99,
+                            "Layer is a continuous raster");
+                        IGeoDataset tContinuousRaster = tDataObj as IGeoDataset;
+                        Dictionary<string, double> tContinuousResults =
+                            WatershedDetailExtraction.SummariseContinuousRaster(pInputRasterGDS, tContinuousRaster);
+                        foreach (string key in tContinuousResults.Keys)
+                        {
+                            string tFieldName = tThisExtraction.ParamName + "_" + key.ToString();
+                            AddAField(tPolygonAsFC, tFieldName, esriFieldType.esriFieldTypeDouble);
+                        }
+                        // re-retrieve the catchment feature now, ensure the FC has the fields we've just added,
+                        // and store the results into the feature
+                        tFeatureCursor = tPolygonAsFC.Search(null, false);
+                        tExtractionPolygonFeature = tFeatureCursor.NextFeature();
+                        foreach (KeyValuePair<string,double> tClassResult in tContinuousResults)
+                        {
+                            string tFieldName = tThisExtraction.ParamName+ "_" + tClassResult.Key.ToString();
+                            //int tFieldIdx = tCatchmentFeature.Fields.FindField(tFieldName);
+                            int tFieldIdx = tExtractionPolygonFeature.Fields.FindField(tFieldName);
+                            if (tFieldIdx != -1)
+                            {
+                                tExtractionPolygonFeature.set_Value(tFieldIdx,tClassResult.Value);
+                                tExtractionPolygonFeature.Store();
+                            }
+                        }
+                        logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99,
+                            "Summary done ok");
+                        break;
+                    default:
+                        // it is a feature class 
+                        // summarise giving count features giving count and stats of the display field if it's float
+                        // or count of each value if it's integer, or nothing if it's text etc
+                        logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99,
+                            "Layer is a feature layer");
+                        IFeatureClass tFC = tDataObj as IFeatureClass;
+                        if (tFC == null)
+                        {
+                            continue;
+                        }
+                        FeatureExtractionResult tResult = WatershedDetailExtraction.SummariseFeatures(
+                            tExtractionPolygon, tFC, tThisExtraction.CategoryField,tThisExtraction.ValueField,
+                            tThisExtraction.MeasureField);
+                        logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99,
+                            "Got extraction result - successful = "+tResult.ExtractionSuccessful.ToString());
+                        
+                        if (tResult.ExtractionSuccessful)
+                        {
+                            string tFieldNameStem = tThisExtraction.ParamName + "_";
+                            // first add all the field then set their values
+                            AddAField(tPolygonAsFC, tFieldNameStem+"Count", esriFieldType.esriFieldTypeInteger);
+                            switch (tFC.ShapeType)
+                            {
+                                case esriGeometryType.esriGeometryPoint:
+                                    break;
+                                case esriGeometryType.esriGeometryPolyline:
+                                    AddAField(tPolygonAsFC,tFieldNameStem+"Length",esriFieldType.esriFieldTypeDouble);
+                                    break;
+                                case esriGeometryType.esriGeometryPolygon:
+                                    AddAField(tPolygonAsFC,tFieldNameStem+"Area",esriFieldType.esriFieldTypeDouble);
+                                    break;
+                            }
+                            if (tResult.HasValues)
+                            {
+                                AddAField(tPolygonAsFC, tFieldNameStem + "Val", esriFieldType.esriFieldTypeDouble);
+                            }
+                            logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99,
+                                                 "Has values: "+tResult.HasValues.ToString());
+                            logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99,
+                                                 "Has categories: " + tResult.HasCategories.ToString());
+
+                            if (tResult.HasCategories)
+                            {
+                                foreach (string categoryVal in tResult.CategoryCounts.Keys)
+                                {
+                                    AddAField(tPolygonAsFC, tFieldNameStem + categoryVal + "_C",
+                                        esriFieldType.esriFieldTypeInteger);
+                                    if (tFC.ShapeType == esriGeometryType.esriGeometryPolyline){
+                                        AddAField(tPolygonAsFC,tFieldNameStem+categoryVal+"_Len",
+                                            esriFieldType.esriFieldTypeDouble);
+                                    }
+                                    else if (tFC.ShapeType == esriGeometryType.esriGeometryPolygon)
+                                    {
+                                        AddAField(tPolygonAsFC, tFieldNameStem + categoryVal + "_Area",
+                                            esriFieldType.esriFieldTypeDouble);
+                                    }
+                                    
+                                    if (tResult.HasValues)
+                                    {
+                                        AddAField(tPolygonAsFC, tFieldNameStem + categoryVal + "_Val",
+                                            esriFieldType.esriFieldTypeDouble);
+                                    }
+                                }
+                            }
+                            // re-retrieve the catchment feature now, ensure the FC has the fields we've just added,
+                            // and store the results into the feature
+                            tFeatureCursor = tPolygonAsFC.Search(null, false);
+                            tExtractionPolygonFeature = tFeatureCursor.NextFeature();
+                            logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99,
+                                                 "Added required fields... ");
+
+                            // now set the values on all the fields we've just added
+                            // first the total count
+                            int tFieldIdx = tPolygonAsFC.FindField(tFieldNameStem+"Count");
+                            if (tFieldIdx != -1)
+                            {
+                                tExtractionPolygonFeature.set_Value(tFieldIdx,tResult.TotalCount);
+                            }
+                            // now the total length/area if appropriate
+                            if (tFC.ShapeType == esriGeometryType.esriGeometryPolyline)
+                            {
+                                tFieldIdx = tPolygonAsFC.FindField(tFieldNameStem + "Length");
+                            }
+                            else if (tFC.ShapeType == esriGeometryType.esriGeometryPolygon)
+                            {
+                                tFieldIdx = tPolygonAsFC.FindField(tFieldNameStem + "Area");
+                            }
+                            else
+                            {
+                                tFieldIdx = -1;
+                            }
+                            if (tFieldIdx != -1)
+                            {
+                                tExtractionPolygonFeature.set_Value(tFieldIdx, tResult.TotalMeasure);
+                            }
+                            // now the total value if appropriate
+                            tFieldIdx = tPolygonAsFC.FindField(tFieldNameStem + "Val");
+                            if (tFieldIdx != -1)
+                            {
+                                tExtractionPolygonFeature.set_Value(tFieldIdx, tResult.TotalValue);
+                            }
+                            // now do the same for the category breakdowns
+                            if (tResult.HasCategories)
+                            {
+                                foreach (KeyValuePair<string,int> catResult in tResult.CategoryCounts)
+                                {
+                                    // set a category count field for all shape types
+                                    tFieldIdx = tPolygonAsFC.FindField(tFieldNameStem + catResult.Key + "_C");
+                                    if (tFieldIdx != -1)
+                                    {
+                                        tExtractionPolygonFeature.set_Value(tFieldIdx, catResult.Value);
+                                    }
+                                    // set a category measure field for polyline / polygon fields only
+                                    if (tFC.ShapeType == esriGeometryType.esriGeometryPolyline)
+                                    {
+                                        tFieldIdx = tPolygonAsFC.FindField(tFieldNameStem + catResult.Key + "_Len");
+                                    }
+                                    else if (tFC.ShapeType == esriGeometryType.esriGeometryPolygon)
+                                    {
+                                        tFieldIdx = tPolygonAsFC.FindField(tFieldNameStem + catResult.Key + "_Area"); 
+                                    }
+                                    else { tFieldIdx = -1; }
+                                    if (tFieldIdx != -1)
+                                    {
+                                        // CategoryMeasures and CategoryCounts have identical keys
+                                        if(tResult.CategoryMeasures.ContainsKey(catResult.Key))
+                                        {
+                                            tExtractionPolygonFeature.set_Value(tFieldIdx, tResult.CategoryMeasures[catResult.Key]);
+                                        }
+                                        else
+                                        {
+                                            logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99,
+                                                 "Whoops! CategoryMeasures dictionary doesn't contain category result key "+catResult.Key);
+                                        }
+                                    }
+                                    if (tResult.HasValues)
+                                    {
+                                        tFieldIdx = tPolygonAsFC.FindField(tFieldNameStem + catResult.Key + "_Val");
+                                        if (tFieldIdx != -1)
+                                        {
+                                            // CategoryTotals and CategoryCounts also have identical keys
+                                            if (tResult.CategoryMeasures.ContainsKey(catResult.Key))
+                                            {
+                                                tExtractionPolygonFeature.set_Value(tFieldIdx, tResult.CategoryTotals[catResult.Key]);
+                                            }
+                                            else
+                                            {
+                                                logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99,
+                                                 "Whoops! CategoryTotals dictionary doesn't contain category result key " + catResult.Key);
+                                            }
+                                        }
+                                    }
+                                //next category
+                                }
+                            //done all categories
+                            }
+                            // all values set
+                            tExtractionPolygonFeature.Store();
+                        // end of processing results from this particular feature class and saving into output polygon
+                        }
+                        logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99,
+                            "Processed layer ok");
+                        break;
+                // end of processing this extraction result switch statement 
+                }
+            // end of loop going over extraction tasks, do the next one
+            }
+            // all extractions (if any) are now complete and the output polygon contains fields representing the results
+            // from every raster and FC extraction
+            // remember everything's by reference so with all that feature class business we have just modified
+            // the input: return ready for output
+            logger.LogMessage(ServerLogger.msgType.debug, "ProcessExtractions", 99,
+                            "All extractions done");
+                        
+            return pInputPolygonGDS;
+        }
+        private byte[] ExtractByPolygonHandler(NameValueCollection boundVariables,
+                                                  JsonObject operationInput,
+                                                      string outputFormat,
+                                                      string requestProperties,
+                                                  out string responseProperties)
+        {
+            // TODO implement code for extraction by input polygon
+            #region Process the REST arguments
+            // hydroshed_id - REQUIRED - to identify the overall result
+            string extraction_id;
+            bool found = operationInput.TryGetString("extraction_id", out extraction_id);
+            if (!found || string.IsNullOrEmpty(extraction_id))
+            {
+                throw new ArgumentNullException("extraction_id");
+            }
+            // input polygon - REQUIRED - the polygon to summarise data within
+            JsonObject jsonPolygon;
+            found = operationInput.TryGetJsonObject("polygon", out jsonPolygon);
+            if (!found)
+            {
+                throw new ArgumentNullException("polygon");
+            }
+            IPolygon extractionPolygon = Conversion.ToGeometry(jsonPolygon, esriGeometryType.esriGeometryPolygon) as IPolygon;
+            
+            responseProperties = null;
+            return null;
+        }
+
         private IGeometry convertAnyJsonGeometry(JsonObject jsonObjectGeometry)
         {
             object[] objArray;
@@ -762,6 +1186,9 @@ namespace WatershedSOE
             {
                 tSchemaLock.ChangeSchemaLock(esriSchemaLock.esriSharedSchemaLock);
             }
+            logger.LogMessage(ServerLogger.msgType.debug, "AddAField", 99,
+                                                 "Added field: " + pFieldName+", success: "+successful.ToString());
+
             return successful;
         }
 
@@ -887,4 +1314,47 @@ namespace WatershedSOE
         }
 
     }
+    internal struct ExtractionLayerConfig
+    {
+        private readonly int m_layerID;
+       // private readonly LayerTypes m_layerType;
+        private readonly ExtractionTypes m_extractionType;
+        private readonly string m_paramName;
+        private readonly int m_categoryField;
+        private readonly int m_valueField;
+        private readonly int m_measureField;
+        internal int LayerID { get { return m_layerID; } }
+        //internal LayerTypes LayerType { get { return m_layerType; } }
+        internal ExtractionTypes ExtractionType { get { return m_extractionType; } }
+        internal string ParamName { get { return m_paramName; } }
+        internal int CategoryField {get {return m_categoryField;}}
+        internal int ValueField {get {return m_valueField;}}
+        internal int MeasureField {get {return m_measureField;}}
+        internal bool HasCategories {get {return m_categoryField != -1;}}
+        internal bool HasValues {get {return m_valueField != -1;}}
+        internal bool HasMeasures {get {return m_measureField != -1;}}
+
+        public ExtractionLayerConfig(int id,  ExtractionTypes extractiontype, string paramname,
+                int CategoryFieldId,int ValueFieldId, int MeasureFieldId)
+        {
+            this.m_layerID = id;
+           // this.m_layerType = layertype;
+            this.m_extractionType = extractiontype;
+            this.m_paramName = paramname;
+            this.m_categoryField = CategoryFieldId;
+            this.m_valueField = ValueFieldId;
+            this.m_measureField = MeasureFieldId;
+        }
+    }
+    internal enum ExtractionTypes
+    {
+        CategoricalRaster,
+        ContinuousRaster,
+        PolygonFeatures,
+        LineFeatures,
+        PointFeatures,
+        Ignore
+    }
+  
 }
+            #endregion
