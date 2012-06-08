@@ -11,153 +11,134 @@ using ESRI.ArcGIS.SOESupport;
 using ESRI.ArcGIS.GeoAnalyst;
 namespace WatershedSOE
 {
+    /// <summary>
+    /// Sealed class providing static methods to clip and summarise raster datasets and feature classes
+    /// based on an input feature. The input feature is to be provided as an IGeoDataset. Methods to summarise
+    /// feature layers require information about whether the feature summary should be grouped by a category
+    /// field and what field if any should be summarised
+    /// </summary>
     [Guid("3f6ba7bd-7605-43bc-9f6c-fcac916d7ba9")]
     [ClassInterface(ClassInterfaceType.None)]
     [ProgId("WatershedSOE.WatershedDetailExtraction")]
-    public class WatershedDetailExtraction
+    public sealed class WatershedDetailExtraction
     {
         private static ServerLogger logger = new ServerLogger();
-        internal static double FindTotalUpstreamLength(IPolygon pCatchmentBoundary, IGeoDataset pRiversGDS)
-        {
-            ServerLogger logger = new ServerLogger();
-            logger.LogMessage(ServerLogger.msgType.debug, "find total upstream length", 99, "Summarising upstream lengths...");
-            try
-            {
-                ISpatialFilter tSpatialFilter = new SpatialFilterClass();
-                tSpatialFilter.Geometry = pCatchmentBoundary as IGeometry;
-                tSpatialFilter.SpatialRel = esriSpatialRelEnum.esriSpatialRelContains;
-                tSpatialFilter.GeometryField = "SHAPE";
-                IFeatureClass tRiversFC = (IFeatureClass)pRiversGDS;
-                IFeatureCursor tFeatureCursor = tRiversFC.Search(tSpatialFilter, false);
-                IFeature tThisArc = tFeatureCursor.NextFeature();
-                double tTotalLength = 0;
-                int tNumberInside = 0;
-                while (tThisArc != null)
-                {
-                    try     {tTotalLength += (double)tThisArc.get_Value(tThisArc.Fields.FindField("LENGTH"));}
-                    catch   {logger.LogMessage(ServerLogger.msgType.debug, "find total upstream length", 99, "problem parsing length field...");}
-                    finally { tNumberInside += 1; tThisArc = tFeatureCursor.NextFeature(); }
-                }
-                logger.LogMessage(ServerLogger.msgType.debug, "find total upstream length", 99, "Number of arcs inside boundary: " + tNumberInside.ToString());
-                // NB This gave the length for arcs within the catchment. Now do ones which cross it
-                // to get the one the site is on (and any others which cross the boundary); for each of these
-                // intersect it with catchment to get the portion inside
-                tSpatialFilter.SpatialRel = esriSpatialRelEnum.esriSpatialRelCrosses;
-                tFeatureCursor = tRiversFC.Search(tSpatialFilter, false);
-                tThisArc = tFeatureCursor.NextFeature();
-                ITopologicalOperator tCatchmentTopoOp = pCatchmentBoundary as ITopologicalOperator;
-                int tNumberCrossing = 0;
-                while (tThisArc != null)
-                {
-                    IGeometry tArcGeometry = tThisArc.ShapeCopy;
-                    IPolyline tArcInside = tCatchmentTopoOp.Intersect(tArcGeometry,esriGeometryDimension.esriGeometry1Dimension) as IPolyline;
-                    tTotalLength += tArcInside.Length;
-                    tNumberCrossing += 1;
-                    tThisArc = tFeatureCursor.NextFeature();
-                }
-                logger.LogMessage(ServerLogger.msgType.debug, "find total upstream length", 99, "Number of arcs crossing boundary: " + tNumberCrossing.ToString());
-                logger.LogMessage(ServerLogger.msgType.debug, "find total upstream length", 99, "Got total upstream length of " + tTotalLength.ToString());
-
-                return tTotalLength;
-            }
-            catch (Exception e)
-            {
-                logger.LogMessage(ServerLogger.msgType.debug, "find total upstream length", 99, "Exception caused in summarising upstream length");
-                logger.LogMessage(ServerLogger.msgType.debug, "find total upstream length", 99, e.Message + " " + e.StackTrace + " " + e.TargetSite);
-                return 0;
-            }
-        }
-        
-        internal static Dictionary<int, double> SummariseCategoricalRaster(IGeoDataset pCatchment, IGeoDataset pClipRaster)
+        internal static RasterExtractionResult SummariseRaster(IGeoDataset pClippingPolygon, ExtractionLayerConfig pExtractionLayerConfig)    
         {
             // set the analysis extent to be that of the polygon
             ServerLogger logger = new ServerLogger();
             logger.LogMessage(ServerLogger.msgType.debug, "SummariseCategoricalRaster", 99, "Categorical raster clip beginning..");
-            IEnvelope tAnalysisExtent = pCatchment.Extent;
-            //IEnvelope tAnalysisExtent = pCatchment.Envelope; IF CATCMENT IS IPOLYGON
+            IEnvelope tAnalysisExtent = pClippingPolygon.Extent;
+            
+            bool pCategoricalSummary = pExtractionLayerConfig.ExtractionType==ExtractionTypes.CategoricalRaster;
+            IGeoDataset pRasterToClip = pExtractionLayerConfig.LayerDataset;
+            
             IRasterAnalysisEnvironment tRasterAnalysisEnvironment = new RasterAnalysisClass();
-            object tAnalysisEnvelopePointlesslyCastedToObject = (System.Object)tAnalysisExtent;
-            object tAnotherPointlessMissingObject = Type.Missing;
-            object tSnapObject = (System.Object)pClipRaster;
+            object tAnalysisEnvelopeCastToObject = (System.Object)tAnalysisExtent;
+           // object tAnotherBizarreMissingObject = Type.Missing;
+            object tSnapObject = (System.Object)pRasterToClip;
             tRasterAnalysisEnvironment.SetExtent(esriRasterEnvSettingEnum.esriRasterEnvValue,
-                ref tAnalysisEnvelopePointlesslyCastedToObject, ref tSnapObject);
+                ref tAnalysisEnvelopeCastToObject, ref tSnapObject);
             tRasterAnalysisEnvironment.SetAsNewDefaultEnvironment();
             // extract the subset of the raster
             IExtractionOp2 tExtractionOp = new RasterExtractionOpClass();
-            // note we are basing the extraction on a raster (in an IGeoDataset) rather than an IPolygon.
+            // note we want to base the extraction on a raster (in an IGeoDataset) rather than an IPolygon.
             // That's because the catchment polygon may be multipart, and the operation doesn't work with multipart.
-            // Doing each part separately would be a faff. And raster mask extraction is probably faster since the
+            // Also the polygon has a max of 1000 vertices.
+            // And raster mask extraction is probably faster since the
             // polygon is converted internally to a grid anyway.
-            IGeoDataset tClipped = tExtractionOp.Raster(pClipRaster, pCatchment);
-            // POLYGON VERSION: tExtractionOp.Polygon(pClipRaster,pPolygon,true)
-
-            logger.LogMessage(ServerLogger.msgType.debug, "SummariseCategoricalRaster", 99, "Categorical raster summary beginning..");
+            IGeoDataset tClipped;
+            if (pRasterToClip as IRaster != null)
+            {
+                logger.LogMessage(ServerLogger.msgType.debug, "SummariseRaster", 99,
+                    "Input was in raster form, using directly to clip...");
+                tClipped = tExtractionOp.Raster(pRasterToClip, pClippingPolygon);
+            }
+            else
+            {
+                // POLYGON VERSION: tExtractionOp.Polygon(pClipRaster,pPolygon,true)
+                // sometimes we need to be able to pass in a polygon but rather than using the polygon
+                // method we'll manually convert to a mask raster to avoid the issues above
+                // It would save work to do this once for each request rather than repeat the conversion
+                // for each layer - but we might want a different environment (snap extent etc) for each.
+                logger.LogMessage(ServerLogger.msgType.debug, "SummariseCategoricalRaster", 99,
+                    "Converting input polygon to mask raster for clip...");
+                IRasterConvertHelper tConvertPolygonToRaster = new RasterConvertHelperClass();
+                // convert it to a raster with the same cell size as the input 
+                IRasterProps tRst = pRasterToClip as IRasterProps;
+                IPnt tRstCellSize = tRst.MeanCellSize();
+                double x = tRstCellSize.X;
+                double y = tRstCellSize.Y;
+                double cellSize = Math.Round(Math.Min(x, y), 0);
+                object tCellSizeAsObjectForNoGoodReason = (System.Object)cellSize;
+                tRasterAnalysisEnvironment.SetCellSize(esriRasterEnvSettingEnum.esriRasterEnvValue,
+                    ref tCellSizeAsObjectForNoGoodReason);
+                IGeoDataset tPolyAsRast =
+                    tConvertPolygonToRaster.ToRaster1(pRasterToClip, "GRID", tRasterAnalysisEnvironment)
+                as IGeoDataset;
+                logger.LogMessage(ServerLogger.msgType.debug, "SummariseCategoricalRaster", 99,
+                    "...done, proceeding with clip");
+                tClipped = tExtractionOp.Raster(pRasterToClip, tPolyAsRast);
+            }
+            // now we have the clipped raster we need to summarise it differently depending on whether
+            // we want a summary by category/value (for categorical rasters) or by stats (for float rasters)
+            Dictionary<string, double> tResults;
+            if (pCategoricalSummary)
+            {
+                tResults = WatershedDetailExtraction.SummariseRasterCategorically(tClipped);
+                if (tResults.Count > 100)
+                {
+                    // sanity check: don't sum up more than 100 different values
+                    tResults = WatershedDetailExtraction.SummariseRasterStatistically(tClipped);
+                    pCategoricalSummary = false;
+                }
+            }
+            else
+            {
+                tResults = WatershedDetailExtraction.SummariseRasterStatistically(tClipped);
+            }
+            tRasterAnalysisEnvironment.RestoreToPreviousDefaultEnvironment();
+            return new RasterExtractionResult(pExtractionLayerConfig.ParamName, pCategoricalSummary, tResults);
+            //return tResults;
+        }
+        internal static Dictionary<string,double> SummariseRasterCategorically(IGeoDataset pRasterGeoDataset)
+        {
             // fiddle about to get to the extracted raster's attribute table
-            IRasterBandCollection tClippedAsBandCollection = tClipped as IRasterBandCollection;
+            IRasterBandCollection tClippedAsBandCollection = pRasterGeoDataset as IRasterBandCollection;
             IRasterBand tClippedBand = tClippedAsBandCollection.Item(0);
             ITable tClippedTable = tClippedBand.AttributeTable;
             // pass through the table once to get the total cell count
             ICursor tTableCursor = tClippedTable.Search(null, false);
             IRow tTableRow = tTableCursor.NextRow();
             double totalcount = 0.0; // store as a double so the percentage division results in a double later
+            Dictionary<string, double> tResultsAsPct = new Dictionary<string, double>();
+            Dictionary<string, int> tResultsCountIntermediate = new Dictionary<string, int>();
+            int rowcount;
+            int rowvalue;
+            int countfield = tClippedTable.FindField("COUNT");
+            int valfield = tClippedTable.FindField("VALUE");
             while (tTableRow != null)
             {
-                totalcount += (int)tTableRow.get_Value(tTableRow.Fields.FindField("COUNT"));
+                rowcount = (int)tTableRow.get_Value(countfield);
+                rowvalue = (int)tTableRow.get_Value(valfield);
+                totalcount += rowcount;
+                tResultsCountIntermediate[rowvalue.ToString()] = rowcount;
                 tTableRow = tTableCursor.NextRow();
             }
-            logger.LogMessage(ServerLogger.msgType.debug, "SummariseCategoricalRaster", 99, "Counted total cells: " + totalcount.ToString());
-            // go through the table again to get the percentage of total of each value
-            tTableCursor = tClippedTable.Search(null, false);
-            tTableRow = tTableCursor.NextRow();
-            Dictionary<int, double> tResultsAsPct = new Dictionary<int, double>();
-            //Dictionary<int,double> tResultsAsArea = new Dictionary<int,double>();
-            IRasterProps tRasterProps = tClippedBand as IRasterProps;
-            double tCellsizeX = tRasterProps.MeanCellSize().X;
-            double tCellsizeY = tRasterProps.MeanCellSize().Y;
-            while (tTableRow != null)
+            // tResultsAsPct is now actually a count of each value
+            foreach (string key in tResultsCountIntermediate.Keys)
             {
-                int tCode = (int)tTableRow.get_Value(tTableRow.Fields.FindField("VALUE"));
-                int tCount = (int)tTableRow.get_Value(tTableRow.Fields.FindField("COUNT"));
-                double tPercent = tCount / totalcount * 100;
-                tResultsAsPct[tCode] = tPercent;
-                //tResultsAsArea[tCode] = tCount * tCellsizeX * tCellsizeY;
-                tTableRow = tTableCursor.NextRow();
+                double countval = tResultsCountIntermediate[key];
+                double tPercent = countval / totalcount *100;
+                tResultsAsPct[key] = tPercent;
             }
-            logger.LogMessage(ServerLogger.msgType.debug, "SummariseCategoricalRaster", 99, "Categorical raster summary done..");
-
-            // restore the default (full) raster analysis environment else the next thing will probably be a catchment
-            // definition with no extent set, according to sod's law, and it won't work
-            tRasterAnalysisEnvironment.RestoreToPreviousDefaultEnvironment();
-            // TODO build an overall results object and dump our dictionary into that
+            logger.LogMessage(ServerLogger.msgType.debug, "SummariseRasterCategorically", 99, "Counted total cells: " + totalcount.ToString()+
+                "in "+tResultsAsPct.Count.ToString()+" categories");
             return tResultsAsPct;
         }
-        internal static Dictionary<string, double> SummariseContinuousRaster(IGeoDataset pCatchment, IGeoDataset pClipRaster)
+        internal static Dictionary<string,double> SummariseRasterStatistically(IGeoDataset pRasterGeoDataset)
         {
-            ServerLogger logger = new ServerLogger();
-            logger.LogMessage(ServerLogger.msgType.debug, "SummariseCategoricalRaster", 99, "Continuous raster clip beginning..");
-            // set analysis extent
-            //IEnvelope tAnalysisExtent = pCatchment.Envelope;
-            IEnvelope tAnalysisExtent = pCatchment.Extent;
-            IRasterAnalysisEnvironment tRasterAnalysisEnvironment = new RasterAnalysisClass();
-            object tAnalysisEnvelopePointlesslyCastedToObject = (System.Object)tAnalysisExtent;
-            object tAnotherPointlessMissingObject = Type.Missing;
-            object tSnapObject = (System.Object)pClipRaster;
-            tRasterAnalysisEnvironment.SetExtent(esriRasterEnvSettingEnum.esriRasterEnvValue,
-                ref tAnalysisEnvelopePointlesslyCastedToObject, ref tSnapObject);
-            tRasterAnalysisEnvironment.SetAsNewDefaultEnvironment();
-            // extract raster subset
-            IExtractionOp2 tExtractionOp = new RasterExtractionOpClass();
-            IGeoDataset tClipped;
-            //if (pCatchment.ExteriorRingCount == 1)
-            //{
-            //tClipped = tExtractionOp.Polygon(pClipRaster, pCatchment, true);
-            tClipped = tExtractionOp.Raster(pClipRaster, pCatchment);
-            //}
-            //else
-            //{
-             //   IRasterConvertHelper tRasterConvertHelper = new RasterConvertHelperClass
-            //}
-            IRasterBandCollection tClippedAsBandCollection = tClipped as IRasterBandCollection;
+            IRasterBandCollection tClippedAsBandCollection = pRasterGeoDataset as IRasterBandCollection;
             IRasterBand tClippedBand = tClippedAsBandCollection.Item(0);
             logger.LogMessage(ServerLogger.msgType.debug, "SummariseContinuousRaster", 99, "Continuous raster clipped, checking stats...");
             bool tHasStatistics;
@@ -175,14 +156,10 @@ namespace WatershedSOE
             tResults["Max"] = tClippedStats.Maximum;
             tResults["Min"] = tClippedStats.Minimum;
             //NB Median isn't available with floating data. (Neither are majority,minority,variety). Would need
-            //to convert to int by multiplying raster first.
+            //to e.g. convert to int by multiplying raster first.
             //tResults["Median"] = tClippedStats.Median;
-            
-            tRasterAnalysisEnvironment.RestoreToPreviousDefaultEnvironment();
-            
             return tResults;
         }
-        
         /// <summary>
         /// Summarise the features of an input feature class that fall within an input polygon.
         /// Input features can be points, lines, or polygons. A value field and a category field can be provided.
@@ -224,9 +201,12 @@ namespace WatershedSOE
         /// category results are each a dictionary of key=category value (as string), value=int or double
         /// </returns>
         internal static FeatureExtractionResult SummariseFeatures(IPolygon pInputPolygon, 
-            //ExtractionLayerConfig pExtractionLayerConfig)
-            IFeatureClass pInputFeatures,int pCategoryFieldNum, int pValueFieldNum, int pMeasureFieldNum)
+            ExtractionLayerConfig pExtractionLayerConfig)
+            //IFeatureClass pInputFeatures,int pCategoryFieldNum, int pValueFieldNum, int pMeasureFieldNum)
         {
+            // use cast rather than as to make sure it blows up if the geodataset isn't 
+            // a feature class
+            IFeatureClass pInputFeatures = (IFeatureClass)pExtractionLayerConfig.LayerDataset;
             esriGeometryType tFCType = pInputFeatures.ShapeType;
             // set up variables to build results
             Dictionary<string, int> tCategoryCounts = new Dictionary<string, int>();
@@ -235,16 +215,16 @@ namespace WatershedSOE
             double tTotalMeasure = 0, tTotalValue = 0;
             int tTotalCount = 0;
             // variables to control search
-            bool hasCategories = pCategoryFieldNum != -1;
-            bool hasMeasures = (pMeasureFieldNum != -1 && 
-                (tFCType == esriGeometryType.esriGeometryPolygon || tFCType == esriGeometryType.esriGeometryPolyline));
-            
-            bool hasPreCalcMeasures = hasMeasures && (pMeasureFieldNum != -1);
+            bool hasCategories = pExtractionLayerConfig.HasCategories;
+            bool hasMeasures = pExtractionLayerConfig.HasMeasures;
+            bool hasPreCalcMeasures = hasMeasures && (pExtractionLayerConfig.MeasureField != -1);
             bool hasValues = false;
-            if (pValueFieldNum != -1)
+            if (pExtractionLayerConfig.HasValues && pExtractionLayerConfig.ValueField != -1)
             {
                 // only numeric fields will be totalled
-                esriFieldType tValueFieldType = pInputFeatures.Fields.get_Field(pValueFieldNum).Type;
+                //esriFieldType tValueFieldType = pInputFeatures.Fields.get_Field(pValueFieldNum).Type;
+                esriFieldType tValueFieldType = pInputFeatures.Fields.get_Field(pExtractionLayerConfig.ValueField)
+                    .Type;
                 if (tValueFieldType == esriFieldType.esriFieldTypeDouble ||
                     tValueFieldType == esriFieldType.esriFieldTypeInteger ||
                     tValueFieldType == esriFieldType.esriFieldTypeSingle ||
@@ -273,7 +253,8 @@ namespace WatershedSOE
                     {
                         try
                         {
-                            tMeasure = (double)tThisFeature.get_Value(pMeasureFieldNum);
+                            //tMeasure = (double)tThisFeature.get_Value(pMeasureFieldNum);
+                            tMeasure = (double)tThisFeature.get_Value(pExtractionLayerConfig.MeasureField);
                         }
                         catch
                         {
@@ -307,7 +288,7 @@ namespace WatershedSOE
                     if (hasCategories)
                     {
                         // get the category / class of this featue
-                        string tCategory = tThisFeature.get_Value(pCategoryFieldNum).ToString();
+                        string tCategory = tThisFeature.get_Value(pExtractionLayerConfig.CategoryField).ToString();
                         // placeholders for the dictionary lookups (out variables)
                         int tCurrentCategoryCount;
                         double tCurrentCategoryMeasure;
@@ -332,7 +313,8 @@ namespace WatershedSOE
                         {
                             // i.e. look up the value from another field, other than just the feature's length/area and count
                             double tCurrentCategoryTotal;
-                            double tCurrentArcValue = (double)tThisFeature.get_Value(pValueFieldNum);
+                            //double tCurrentArcValue = (double)tThisFeature.get_Value(pValueFieldNum);
+                            double tCurrentArcValue = (double)tThisFeature.get_Value(pExtractionLayerConfig.ValueField);
                             tTotalValue += tCurrentArcValue;
                             if (tCategoryTotals.TryGetValue(tCategory, out tCurrentCategoryTotal))
                             {
@@ -346,7 +328,8 @@ namespace WatershedSOE
                     }
                     else if (hasValues)
                     {
-                        double tCurrentArcValue = (double)tThisFeature.get_Value(pValueFieldNum);
+                        //double tCurrentArcValue = (double)tThisFeature.get_Value(pValueFieldNum);
+                        double tCurrentArcValue = (double)tThisFeature.get_Value(pExtractionLayerConfig.ValueField);
                         tTotalValue += tCurrentArcValue;
                     }
                     tThisFeature = tFeatureCursor.NextFeature();
@@ -382,6 +365,7 @@ namespace WatershedSOE
                     {
                         // return (so track) the number of partially-included features separately from the overall total
                         tNumberCrossingBoundary += 1;
+                        tTotalCount += 1;
                         // either the length or area of the intersected feature:
                         double tMeasure = 0;
                         // either the length or area of entire original intersected feature
@@ -406,7 +390,8 @@ namespace WatershedSOE
                         tTotalMeasure += tMeasure;
                         if (hasCategories)
                         {
-                            string tCategory = tThisFeature.get_Value(pCategoryFieldNum).ToString();
+                            //string tCategory = tThisFeature.get_Value(pCategoryFieldNum).ToString();
+                            string tCategory = tThisFeature.get_Value(pExtractionLayerConfig.CategoryField).ToString();
                             int tCurrentCategoryCount;
                             double tCurrentCategoryMeasure;
                             if (tCategoryCounts.TryGetValue(tCategory, out tCurrentCategoryCount))
@@ -433,7 +418,9 @@ namespace WatershedSOE
                                 // The raster equivalent is to count all or none based on cell centre, so maybe we should count
                                 // all or none based on centroid??
                                 double tCurrentCategoryTotal;
-                                double tCurrentFeatureValue = (double)tThisFeature.get_Value(pValueFieldNum);
+                                //double tCurrentFeatureValue = (double)tThisFeature.get_Value(pValueFieldNum);
+                                double tCurrentFeatureValue = (double)tThisFeature.get_Value(
+                                    pExtractionLayerConfig.ValueField);
                                 double tScaledFeatureValue = (tMeasure / tOriginalMeasure) * tCurrentFeatureValue;
                                 tTotalValue += tScaledFeatureValue;
                                 if (tCategoryTotals.TryGetValue(tCategory,out tCurrentCategoryTotal))
@@ -448,7 +435,8 @@ namespace WatershedSOE
                         }
                         else if (hasValues)
                         {
-                            double tCurrentFeatureValue = (double)tThisFeature.get_Value(pValueFieldNum);
+                            //double tCurrentFeatureValue = (double)tThisFeature.get_Value(pValueFieldNum);
+                            double tCurrentFeatureValue = (double)tThisFeature.get_Value(pExtractionLayerConfig.ValueField);
                             double tScaledFeatureValue = (tMeasure / tOriginalMeasure)*tCurrentFeatureValue;
                             tTotalValue += tScaledFeatureValue;
                         }
@@ -462,12 +450,14 @@ namespace WatershedSOE
                 if (hasValues) { outValue = tTotalValue; }
                 else { outValue = null; }
                 FeatureExtractionResult tResult = new FeatureExtractionResult(
+                    pExtractionLayerConfig.ParamName,
                     tTotalCount,
                     outMeasure,
                     outValue,
                     tCategoryCounts,
                     tCategoryMeasures,
-                    tCategoryTotals
+                    tCategoryTotals,
+                    pInputFeatures.ShapeType
                 );
                 return tResult;
 
@@ -476,7 +466,7 @@ namespace WatershedSOE
             {
                 logger.LogMessage(ServerLogger.msgType.debug, "process features", 99, "error summarising features in " +
                            pInputFeatures.AliasName+" Detail: " + ex.StackTrace + " " + ex.Message);
-                return new FeatureExtractionResult("An error occurred with extraction from "+pInputFeatures.AliasName);
+                return new FeatureExtractionResult("An error occurred with extraction from "+pInputFeatures.AliasName,pExtractionLayerConfig.ParamName);
             }
         }
        
@@ -490,6 +480,7 @@ namespace WatershedSOE
     }
     internal struct FeatureExtractionResult
     {
+        private string m_paramName;
         private readonly bool m_successful;
         private readonly bool m_hascategories;
         private readonly bool m_hasvalues;
@@ -501,6 +492,7 @@ namespace WatershedSOE
         private readonly double m_totalvalue;
         private readonly double m_totalmeasure;
         private readonly string m_errormessage;
+        private readonly esriGeometryType m_ExtractionType;
 
         internal Dictionary<string,int> CategoryCounts { get { return m_categorycounts; } }
         internal Dictionary<string,double> CategoryMeasures { get { return m_categorymeasures; } }
@@ -512,14 +504,30 @@ namespace WatershedSOE
         internal bool HasCategories { get { return m_hascategories; } }
         internal bool HasValues { get { return m_hasvalues; } }
         internal bool HasMeasures { get { return m_hasmeasures; } }
-
+        //internal esriGeometryType ExtractionType { get { return m_ExtractionType; } }
+        internal ExtractionTypes ExtractionType {get 
+            {
+                switch (m_ExtractionType)
+                {
+                    case esriGeometryType.esriGeometryPoint:
+                        return ExtractionTypes.PointFeatures;
+                    case esriGeometryType.esriGeometryPolyline:
+                        return ExtractionTypes.LineFeatures;
+                    case esriGeometryType.esriGeometryPolygon:
+                        return ExtractionTypes.PolygonFeatures;
+                    default:
+                        return ExtractionTypes.Ignore;
+                }
+            }
+        }
         internal string ErrorMessage { get { return m_errormessage; } }
-
-        public FeatureExtractionResult(int TotalCount, double? TotalMeasure, double? TotalValue,
+        internal string ParamName { get { return m_paramName; } }
+        public FeatureExtractionResult(string ParamName, int TotalCount, double? TotalMeasure, double? TotalValue,
             Dictionary<string,int> CategoryCounts, Dictionary<string,double> CategoryMeasures, 
-            Dictionary<string,double> CategoryTotals)
+            Dictionary<string,double> CategoryTotals,esriGeometryType ExtractionType)
         {
             this.m_successful = true;
+            this.m_paramName = ParamName;
             // all parameters except for totalcount can be null
             // i.e. in the case where we have just counted the total number of points with no categories
             // or values
@@ -563,10 +571,12 @@ namespace WatershedSOE
                 // it must be points
                 this.m_hasmeasures=false;
             }
+            this.m_ExtractionType = ExtractionType;
             this.m_categorytotals = CategoryTotals;
             this.m_errormessage = "No errors occurred";
+
         }
-        public FeatureExtractionResult(string ErrorMessage)
+        public FeatureExtractionResult(string ErrorMessage,string paramName)
         {
             this.m_successful = false;
             this.m_errormessage = ErrorMessage;
@@ -579,6 +589,8 @@ namespace WatershedSOE
             this.m_categorycounts = null;
             this.m_categorymeasures = null;
             this.m_categorytotals = null;
+            this.m_ExtractionType = esriGeometryType.esriGeometryNull;
+            this.m_paramName = paramName;
 
         }
     }
